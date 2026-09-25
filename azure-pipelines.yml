@@ -1,0 +1,269 @@
+# Azure DevOps Pipeline for AKS Auto-Recovery & Monitoring
+# This pipeline runs the automation scripts on a schedule or on demand
+
+trigger:
+  none  # Don't run on code commits, use schedule instead
+
+schedules:
+  - cron: "*/10 * * * *"  # Every 10 minutes
+    displayName: "Pod Recovery Check"
+    branches:
+      include:
+        - main
+    always: true
+
+  - cron: "0 * * * *"  # Every hour
+    displayName: "Node Health Check"
+    branches:
+      include:
+        - main
+    always: true
+
+  - cron: "0 2 * * 0"  # Every Sunday at 2 AM
+    displayName: "Weekly Redis Maintenance"
+    branches:
+      include:
+        - main
+    always: false
+
+stages:
+  - stage: PreChecks
+    displayName: "Pre-Execution Checks"
+    jobs:
+      - job: ValidateEnvironment
+        displayName: "Validate Dependencies"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: Bash@3
+            displayName: "Check Azure CLI"
+            inputs:
+              targetType: "inline"
+              script: |
+                az --version
+                echo "✓ Azure CLI is available"
+
+          - task: Bash@3
+            displayName: "Check kubectl"
+            inputs:
+              targetType: "inline"
+              script: |
+                kubectl version --client
+                echo "✓ kubectl is available"
+
+  - stage: PodRecovery
+    displayName: "Pod Recovery"
+    dependsOn: []
+    condition: |
+      or(
+        eq(variables['Build.Reason'], 'Schedule'),
+        eq(variables['Build.Reason'], 'Manual')
+      )
+    jobs:
+      - job: RestartUnhealthyPods
+        displayName: "Restart Unhealthy Pods"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+
+          - task: KubernetesManifest@0
+            displayName: "Set kubectl Context"
+            inputs:
+              action: "deploy"
+              kubernetesServiceConnection: "$(kubernetesServiceConnection)"
+              namespace: "kube-system"
+              manifests: |
+                $(System.DefaultWorkingDirectory)/k8s/pod-recovery-cronjob.yaml
+
+          - task: Bash@3
+            displayName: "Run Pod Recovery Script"
+            inputs:
+              targetType: "filePath"
+              filePath: "$(System.DefaultWorkingDirectory)/scripts/aks_pod_recovery.sh"
+              arguments: "default"
+            env:
+              KUBECONFIG: $(kubeConfig)
+
+          - task: Bash@3
+            displayName: "Log Recovery Summary"
+            condition: "always()"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Pod recovery check completed"
+                kubectl get pods -A --no-headers | grep -v Running | wc -l || echo "0"
+
+  - stage: NodeHealthCheck
+    displayName: "Node Health Monitoring"
+    dependsOn: []
+    jobs:
+      - job: CheckNodeHealth
+        displayName: "Check Node Health"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+
+          - task: Bash@3
+            displayName: "Run Node Health Check Script"
+            inputs:
+              targetType: "filePath"
+              filePath: "$(System.DefaultWorkingDirectory)/scripts/node_health_check.sh"
+            env:
+              KUBECONFIG: $(kubeConfig)
+
+          - task: Bash@3
+            displayName: "Parse Health Results"
+            condition: "always()"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Node health check completed at $(date)"
+                kubectl get nodes -o wide
+
+  - stage: DatadogMetrics
+    displayName: "Send Metrics to Datadog"
+    dependsOn: []
+    jobs:
+      - job: PublishMetrics
+        displayName: "Publish Cluster Health Metrics"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+
+          - task: Bash@3
+            displayName: "Run Datadog Monitoring Script"
+            inputs:
+              targetType: "filePath"
+              filePath: "$(System.DefaultWorkingDirectory)/scripts/datadog_k8s_monitoring.sh"
+            env:
+              DD_API_KEY: $(datadogApiKey)
+              DD_APP_KEY: $(datadogAppKey)
+              CLUSTER_NAME: $(clusterName)
+              KUBECONFIG: $(kubeConfig)
+            continueOnError: true
+
+          - task: Bash@3
+            displayName: "Verify Datadog Send"
+            condition: "always()"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Metrics sent to Datadog dashboard"
+                echo "Check: https://app.datadoghq.com/dashboard"
+
+  - stage: RedisMaintenance
+    displayName: "Redis Cache Maintenance"
+    dependsOn: []
+    condition: |
+      and(
+        eq(variables['Build.Reason'], 'Schedule'),
+        eq(variables['Build.SourceBranchName'], 'main'),
+        or(
+          eq(variables['Build.SourceVersion'], variables['Build.SourceVersionMessage']),
+          in(variables['System.DayOfWeek'], 'Sunday')
+        )
+      )
+    jobs:
+      - job: MaintainRedis
+        displayName: "Flush and Restart Redis"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Authenticate to Azure"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az account show
+
+          - task: Bash@3
+            displayName: "Run Redis Maintenance Script"
+            inputs:
+              targetType: "filePath"
+              filePath: "$(System.DefaultWorkingDirectory)/scripts/redis_maintenance.sh"
+            env:
+              RESOURCE_GROUP: $(resourceGroup)
+              REDIS_NAME: $(redisName)
+
+          - task: Bash@3
+            displayName: "Post-Maintenance Verification"
+            condition: "always()"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "Redis maintenance completed at $(date)"
+                echo "Check Azure portal for Redis status"
+
+  - stage: NotifyResults
+    displayName: "Notify Results"
+    dependsOn:
+      - PodRecovery
+      - NodeHealthCheck
+      - DatadogMetrics
+    condition: "always()"
+    jobs:
+      - job: SendNotification
+        displayName: "Send Completion Notification"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: Bash@3
+            displayName: "Pipeline Summary"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "=== AKS Auto-Recovery Pipeline Complete ==="
+                echo "Date: $(date)"
+                echo "Build ID: $(Build.BuildId)"
+                echo "Reason: $(Build.Reason)"
+                echo "=================="
+
+          - task: Slack@0
+            displayName: "Notify Slack (Optional)"
+            condition: "always()"
+            inputs:
+              webhookUrl: "$(slackWebhookUrl)"
+              message: |
+                AKS Health Check Complete
+                Build: $(Build.BuildNumber)
+                Status: $(Build.Status)
+              enabled: false  # Enable if you have Slack webhook
+
+          - task: SendEmail@1
+            displayName: "Send Email Report (Optional)"
+            condition: "always()"
+            inputs:
+              To: "$(notificationEmail)"
+              Subject: "AKS Auto-Recovery Report - $(System.TeamFoundationCollectionUri)"
+              Body: |
+                Pipeline: $(Build.DefinitionName)
+                Run: $(Build.BuildNumber)
+                Status: $(Build.Status)
+                Time: $(System.CollectionUri)
+              sendMailCustomEndpoint: ""
+              enabled: false  # Enable if email is configured
+
+variables:
+  # Service Connections - configure in Azure DevOps
+  kubernetesServiceConnection: "aks-cluster"  # Set in pipeline settings
+  azureServiceConnection: "Azure"  # Set in pipeline settings
+
+  # Secrets - configure in Azure DevOps Variable Group
+  kubeConfig: $(kubeConfigSecret)
+  datadogApiKey: $(DD_API_KEY)
+  datadogAppKey: $(DD_APP_KEY)
+  clusterName: "aks-prod"
+  resourceGroup: "rg-prod"
+  redisName: "aks-cache"
+  notificationEmail: "devops@company.com"
+  slackWebhookUrl: $(SLACK_WEBHOOK)
+
+pool:
+  vmImage: "ubuntu-latest"

@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aks-recovery-sa
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aks-recovery-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aks-recovery-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aks-recovery-role
+subjects:
+  - kind: ServiceAccount
+    name: aks-recovery-sa
+    namespace: kube-system
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aks-pod-recovery
+  namespace: kube-system
+spec:
+  schedule: "*/10 * * * *"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: aks-recovery-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: recovery
+              image: bitnami/kubectl:latest
+              command:
+                - /bin/bash
+                - -c
+              args:
+                - |
+                  echo "Checking for unhealthy pods..."
+                  kubectl get pods -A --no-headers --field-selector=status.phase!=Running 2>/dev/null | awk '{print $2, $1}' | while read -r pod ns; do
+                    echo "Restarting unhealthy pod: $ns/$pod"
+                    kubectl delete pod "$pod" -n "$ns" --grace-period=30 || true
+                  done
+                  echo "Pod recovery cycle complete."
